@@ -76,9 +76,25 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/** Shut the server down cleanly if the harness stops the process early. */
+function installSignalHandlers(server: ReturnType<typeof createApp>): void {
+  let shuttingDown = false;
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.once(signal, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      process.stdout.write(`[entry] ${signal} received: closing\n`);
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 5_000).unref();
+    });
+  }
+}
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  process.stdout.write('[entry] github-core-clone forge starting\n');
   const server = createApp();
+  installSignalHandlers(server);
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
