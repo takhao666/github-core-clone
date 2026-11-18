@@ -232,8 +232,8 @@ function sha1Hex(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
 function objectId(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Same digest as hashing header || data, without allocating the joined copy.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 function storeObject(repo: Repo, type: ObjType, data: Buffer): string {
   const sha = objectId(type, data);
@@ -547,24 +547,50 @@ function diffTrees(repo: Repo, oldTree: string, newTree: string): Array<{ path: 
 // ---------------------------------------------------------------------------
 // Packfiles (version 2, SHA-1, no deltas on the wire out)
 
+/** Adler-32 of `data` (the checksum a zlib stream carries as its last four bytes). */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  // NMAX 5552: defer the mod so the inner loop stays plain integer adds.
+  for (let off = 0; off < data.length; off += 5552) {
+    const end = Math.min(data.length, off + 5552);
+    for (let i = off; i < end; i += 1) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /** Decompress one zlib stream starting at `offset`; returns its bytes and length. */
 function inflateOne(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
-  // inflateSync ignores trailing bytes and throws on truncation, so the
-  // minimal slice that inflates to the expected size is the stream itself.
-  let lo = 0;
-  let hi = buf.length - offset;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
+  // inflateSync ignores trailing bytes, so one call inflates the object and
+  // the stream's own trailer — the Adler-32 of the output, big-endian, the
+  // last four bytes of the stream — marks where it ends. Scan for those four
+  // bytes and verify the candidate by inflating exactly that slice: a
+  // coincidental match inside the deflate data fails the verification (the
+  // slice is a truncated stream) and the scan continues. No binary search,
+  // and no exception on the common path (the old search threw on roughly
+  // half its probes, each throw capturing a stack trace).
+  const data = inflateSync(buf.subarray(offset));
+  if (data.length !== expectedSize) throw new Error('inflate size mismatch');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let from = offset + 2; // the zlib header is two bytes; the trailer cannot start before it
+  for (;;) {
+    const at = buf.indexOf(needle, from);
+    if (at < 0) throw new Error('zlib stream end not found');
+    const end = at + 4;
     try {
-      const out = inflateSync(buf.subarray(offset, offset + mid));
-      if (out.length === expectedSize) hi = mid;
-      else lo = mid + 1;
+      const check = inflateSync(buf.subarray(offset, end));
+      if (check.length === expectedSize) return { data, consumed: end - offset };
     } catch {
-      lo = mid + 1;
+      // A coincidental Adler match inside the deflate data: keep scanning.
     }
+    from = at + 1;
   }
-  const data = inflateSync(buf.subarray(offset, offset + lo));
-  return { data, consumed: lo };
 }
 
 interface ParsedPack {
